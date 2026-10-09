@@ -230,3 +230,33 @@ French, German, Portuguese and Russian. Locale precedence remains LC_ALL,
 LC_MESSAGES, LANG, then Qt locale. Country variants select the base language
 (e.g. pt_BR and pt_PT both use Portuguese); unsupported languages fall back to
 English. Action buttons wrap within the panel for longer translated labels.
+
+## License, third-party dependencies and wallpaper rights
+
+This plugin is licensed under the [MIT License](LICENSE). Its license covers
+the plugin's code and documentation, not imported wallpapers or third-party
+dependencies.
+
+- [timewall](https://github.com/bcyran/timewall) is an external backend. The
+  pinned 2.1.0 source is MIT-licensed, copyright Bazyli Cyran. The optional build
+  helper retains the upstream license in its private source copy; distributing
+  timewall source or binaries requires retaining its copyright and license
+  notice, along with the applicable dependency notices.
+- [libheif](https://github.com/strukturag/libheif#license) is licensed under
+  LGPL-3.0-or-later. Runtime dependencies are installed separately; this
+  repository does not distribute timewall, libheif or codec binaries. Their
+  licenses remain applicable, and any future bundled binary distribution must
+  meet the licenses of the components it includes.
+- No Apple wallpaper artwork or HEIC/HEIF wallpaper files are included. Import
+  support does not grant rights to an image. Users must have the rights needed
+  for their use of imported files; publishing or redistributing wallpapers or
+  screenshots containing them may require separate permission.
+- HEIC commonly uses HEVC, which can be subject to patent licensing. Open-source
+  copyright licenses do not establish that all necessary patent rights are
+  available. Requirements depend on jurisdiction and use/distribution model;
+  commercial distribution or bundling codecs requires separate assessment.
+
+This is an independent community project and is not affiliated with, sponsored
+by or endorsed by Apple Inc. Apple and macOS are trademarks of Apple Inc.
+References to Apple technology describe compatibility only. Marketplace listing
+does not constitute legal clearance or a security certification.
