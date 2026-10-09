@@ -165,3 +165,20 @@ root. The standalone compatibility manifest is therefore named
 uninstall regression checks cover this mapping. The submission preparation run
 passed 44 Python tests, skipping 11 backend/live-desktop tests, and the root
 package passed `omarchy-plugin-validate`.
+
+## Oversized display images (0.3.1)
+
+The Fuji.heic download decodes into eight 9600×7168 frames. An isolated real-file
+import generated eight 3840×2867 display images and eight 1024×764 thumbnails,
+preserving the original HEIC, full-size PNGs and schedule metadata. A compiled
+Qt 6 QImageReader check reproduced rejection of the original PNG and successfully
+read the display image and thumbnail with the normal allocation limit.
+
+The final real-backend regression run executed 61 Python tests: 58 passed and
+three live GTK picker tests were skipped. New checks cover oversized-image
+scaling, source preservation, cache reuse, damaged-cache regeneration, atomic
+failure handling, legacy-library migration, rotation, pixel budgets and
+responsive status during preparation. The local-socket integration test passed
+outside the tool sandbox. Locale/frame-label Node checks, offscreen library UI
+interaction and root package validation also passed. The installed user service
+was updated to 0.3.1 and retained its disabled mode.

@@ -15,13 +15,14 @@ import select
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 import threading
 
-VERSION = '0.3.0'
+VERSION = '0.3.1'
 PLUGIN_ID = 'org.omarchy.heic'
 
 
@@ -97,6 +98,107 @@ class Backend:
         self.paths = paths
         self.binary = os.environ.get('OMARCHY_HEIC_TIMEWALL', 'timewall')
         self.helper = Path(__file__).resolve().parent / 'omarchy-heic-capture'
+        self.image_lock = threading.RLock()
+        self.profile = (3840, 2160)
+        self.profile_checked = -math.inf
+
+    @staticmethod
+    def png_size(path):
+        with path.open('rb') as source:
+            header = source.read(24)
+        if len(header) != 24 or header[:16] != b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR':
+            raise RuntimeError('Invalid decoded PNG image')
+        width, height = struct.unpack('>II', header[16:24])
+        if not width or not height:
+            raise RuntimeError('Invalid decoded PNG dimensions')
+        return width, height
+
+    def display_bounds(self):
+        # Physical output pixels, including rotated monitors. Avoid querying
+        # Hyprland for every sample of a solar day preview.
+        with self.image_lock:
+            now = time.monotonic()
+            if now - self.profile_checked >= 30:
+                try:
+                    result = subprocess.run(['hyprctl', 'monitors', '-j'], check=True,
+                                            capture_output=True, text=True, timeout=2)
+                    sizes = []
+                    for monitor in json.loads(result.stdout):
+                        if monitor.get('disabled'):
+                            continue
+                        w, h = int(monitor['width']), int(monitor['height'])
+                        if int(monitor.get('transform', 0)) % 2:
+                            w, h = h, w
+                        if w > 0 and h > 0:
+                            sizes.append((w, h))
+                    if sizes:
+                        self.profile = max(w for w, h in sizes), max(h for w, h in sizes)
+                except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+                    pass  # Keep the last profile, or the safe headless default.
+                self.profile_checked = now
+            w, h = self.profile
+            factor = min(1, 8192 / w, 8192 / h, math.sqrt(32_000_000 / (w * h)))
+            return max(1, int(w * factor)), max(1, int(h * factor))
+
+    def derived_image(self, source, bounds, category):
+        with self.image_lock:
+            width, height = self.png_size(source)
+            # Preserve aspect ratio and never upscale. A wide image must retain
+            # enough height for a landscape/portrait desktop's crop-to-fill.
+            factor = min(1, (min(bounds[0] / width, bounds[1] / height)
+                            if category == 'thumbnails' else
+                            max(bounds[0] / width, bounds[1] / height)),
+                         8192 / width, 8192 / height,
+                         math.sqrt(32_000_000 / (width * height)))
+            size = max(1, int(width * factor)), max(1, int(height * factor))
+            if category != 'thumbnails' and size == (width, height):
+                return str(source)
+            target = source.parent / category / f'v1-{size[0]}x{size[1]}' / source.name
+            try:
+                if target.is_file() and self.png_size(target) == size:
+                    return str(target)
+            except (OSError, RuntimeError):
+                pass  # Rebuild an incomplete or damaged derivative atomically.
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd, temporary = tempfile.mkstemp(suffix='.png', dir=target.parent)
+            os.close(fd)
+            try:
+                # PNG compression alone cannot fix Qt's decoded-pixel limit.
+                # One external decoder at a time bounds peak memory use.
+                result = subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-y',
+                    '-threads', '1', '-i', str(source), '-vf',
+                    f'scale={size[0]}:{size[1]}:flags=lanczos', '-frames:v', '1',
+                    '-threads', '1', '-compression_level', '1', temporary],
+                    capture_output=True, text=True, timeout=120)
+                if result.returncode or self.png_size(Path(temporary)) != size:
+                    raise RuntimeError('Image preparation failed: ' + result.stderr[-1500:].strip())
+                os.replace(temporary, target)
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+            return str(target)
+
+    def library_image(self, entry, index):
+        library_root = (self.paths.data / 'library').resolve()
+        library = (library_root / entry['id']).resolve(strict=True)
+        if library.parent != library_root or int(index) < 0:
+            raise RuntimeError('Invalid library image')
+        image = (library / f'{int(index)}.png').resolve(strict=True)
+        if image.parent != library or not image.is_file():
+            raise RuntimeError('Invalid library image')
+        return image
+
+    def prepare_entry(self, entry):
+        # Also upgrades existing imports, without copying or decoding HEIC again.
+        frames = []
+        for frame in entry.get('frames', []):
+            image = self.library_image(entry, frame['index'])
+            thumbnail = self.derived_image(image, (1024, 1024), 'thumbnails')
+            self.derived_image(image, self.display_bounds(), 'display')
+            frames.append(dict(frame, thumbnail=thumbnail))
+        if frames:
+            entry = dict(entry, frames=frames)
+            atomic_json(self.paths.data / 'library' / entry['id'] / 'metadata.json', entry)
+        return entry
 
     def run(self, args, location=None, capture=False, simulated=None, dry=False):
         self.paths.prepare()
@@ -160,7 +262,7 @@ class Backend:
                     shutil.rmtree(target)  # Only an incomplete plugin-owned import.
                 os.replace(staged, target)
                 # TemporaryDirectory cleanup sees the now absent staging directory.
-        return read_json(target / 'metadata.json', {})
+        return self.prepare_entry(read_json(target / 'metadata.json', {}))
 
     def select(self, entry, location, appearance, simulated=None, dry=False):
         # Time/appearance selection is cheap metadata arithmetic. Reuse decoded
@@ -176,17 +278,14 @@ class Backend:
         elif entry['kind'] == 'appearance':
             index = int(properties['l' if appearance == 'light' else 'd'])
         if index is not None:
-            library = (self.paths.data / 'library' / entry['id']).resolve()
-            image = (library / f'{index}.png').resolve(strict=True)
-            if image.parent != library or not image.is_file():
-                raise RuntimeError('Invalid library image')
-            return str(image)
+            return self.derived_image(self.library_image(entry, index), self.display_bounds(), 'display')
         args = ['set', str(self.paths.data / 'library' / entry['id'] / 'wallpaper.heic')]
         if entry['kind'] == 'appearance':
             args += ['--appearance', appearance]
         if entry['kind'] == 'solar' and location is None:
             raise RuntimeError('Solar wallpaper needs a location; set latitude and longitude first')
-        return self.run(args, location, capture=not dry, simulated=simulated, dry=dry)
+        selected = Path(self.run(args, location, capture=not dry, simulated=simulated, dry=dry))
+        return self.derived_image(self.library_image(entry, int(selected.stem)), self.display_bounds(), 'display')
 
 
     def day_plan(self, entry, location, day, cancelled, progress):
@@ -241,6 +340,7 @@ class Controller:
         self.last_clock = (time.time(), time.monotonic())
         self.last_import = None
         self.importing = None
+        self.preparing_selection = False
         self.import_job = None
         self.import_cancel = threading.Event()
         self.import_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -248,6 +348,9 @@ class Controller:
         self.preview_job = None
         self.preview_cancel = threading.Event()
         self.preview_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        if (self.cfg.get('selected') in [e['id'] for e in self.entries()]
+                and hasattr(self.backend, 'prepare_entry')):
+            self.prepare_selected()
         # A persisted snapshot restores a preview interrupted by a crash/restart.
         snapshot = self.state.pop('preview_restore', None)
         if snapshot:
@@ -297,7 +400,7 @@ class Controller:
                        capture_output=True, text=True, timeout=20)
 
     def compute(self, force=False):
-        if self.state['mode'] != 'active':
+        if self.state['mode'] != 'active' or self.preparing_selection:
             return
         before = self.background()
         theme_before = self.theme_name()
@@ -495,6 +598,36 @@ class Controller:
             self.cfg['selected'] = result['imported'][-1]
             self.force = True
 
+    def prepare_selected(self):
+        entry = self.entry()
+        ready = bool(entry.get('frames'))
+        for frame in entry.get('frames', []):
+            thumbnail = Path(frame.get('thumbnail', ''))
+            if not thumbnail.is_file():
+                ready = False
+                break
+            if hasattr(self.backend, 'png_size'):
+                try:
+                    if max(self.backend.png_size(thumbnail)) > 1024:
+                        ready = False
+                except (OSError, RuntimeError):
+                    ready = False
+        if not entry.get('frames') or ready:
+            return
+        self.importing = dict(completed=0, total=1)
+        self.preparing_selection = True
+        progress = self.importing
+        def prepare():
+            try:
+                self.backend.prepare_entry(entry)
+                return dict(imported=[], errors=[], finished_at=time.time_ns())
+            except Exception as exc:
+                print(f'Image preparation failed: {exc}', file=sys.stderr, flush=True)
+                return dict(imported=[], errors=[dict(file=entry['name'], error=str(exc))], finished_at=time.time_ns())
+            finally:
+                progress['completed'] = 1
+        self.import_job = self.import_pool.submit(prepare)
+
     def import_tick(self):
         if self.import_job is None or not self.import_job.done():
             return
@@ -504,6 +637,7 @@ class Controller:
             self.state['error'] = str(exc)
         self.import_job = None
         self.importing = None
+        self.preparing_selection = False
         self.save()
 
     def dispatch(self, request):
@@ -536,6 +670,8 @@ class Controller:
                 raise ValueError('Unknown wallpaper')
             self.cfg['selected'] = request['id']
             self.force = True
+            if hasattr(self.backend, 'prepare_entry'):
+                self.prepare_selected()
         elif cmd == 'remove':
             identity = request['id']
             if identity not in [e['id'] for e in self.entries()]:

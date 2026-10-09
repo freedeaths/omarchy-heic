@@ -76,6 +76,8 @@ def install(backend, shell_managed=False):
     if version != 'timewall 2.1.0':
         raise RuntimeError(f'Validated backend is timewall 2.1.0; found {version}')
     # Preflight all file conflicts before writing any of the installation.
+    if not shutil.which('ffmpeg'):
+        raise RuntimeError('Install ffmpeg first for display images and thumbnails')
     mappings = [(ROOT / 'bin' / name, BIN / name) for name in ('omarchy-heic', 'omarchy-heic-capture', 'omarchy-heic-picker')]
     if not shell_managed:
         # Marketplace packages have one root manifest. The standalone installer

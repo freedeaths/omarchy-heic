@@ -19,7 +19,7 @@ Ui.Panel {
   property string seenImport: ""
   property bool statusLoaded: false
   readonly property bool bundledSetup: /\/plugin\/Panel.qml$/.test(Qt.resolvedUrl("Panel.qml").toString())
-  readonly property string runtimeVersion: "0.3.0"
+  readonly property string runtimeVersion: "0.3.1"
   readonly property bool importing: !!desktop.importing
   readonly property string language: I18n.language(Quickshell.env("LC_ALL"), Quickshell.env("LC_MESSAGES"), Quickshell.env("LANG"), Qt.locale().name)
   readonly property bool previewing: !!desktop.preview
@@ -176,7 +176,7 @@ Ui.Panel {
           sourceSize.width: 1024
           fillMode: Image.PreserveAspectFit
           asynchronous: true
-          source: root.frames.length ? Commons.Util.fileUrl(root.frames[root.previewIndex].path) : ""
+          source: root.frames.length && root.frames[root.previewIndex].thumbnail ? Commons.Util.fileUrl(root.frames[root.previewIndex].thumbnail) : ""
         }
       }
       Row {

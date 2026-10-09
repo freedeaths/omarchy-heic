@@ -35,11 +35,11 @@ the panel. Installing the panel does not enable dynamic wallpaper playback.
 ### 2. Prepare dependencies and timewall
 
 If you already have a compatible **timewall 2.1.0** on PATH, install the runtime
-packages with `omarchy pkg add python python-gobject gtk3 libheif`, then continue
+packages with `omarchy pkg add python python-gobject gtk3 libheif ffmpeg`, then continue
 to step 3. Otherwise, the tested source-build path is:
 
 ```sh
-omarchy pkg add python python-gobject gtk3 libheif git pkgconf clang rustup
+omarchy pkg add python python-gobject gtk3 libheif ffmpeg git pkgconf clang rustup
 rustup toolchain install stable
 mkdir -p ~/Repos
 git clone https://github.com/bcyran/timewall.git ~/Repos/timewall &&
@@ -98,6 +98,7 @@ need to compare the installed commit with the reviewed version.
 ## Backend compatibility and standalone installation
 
 Python 3.11+, GTK 3 and python-gobject (for the isolated multi-file chooser),
+FFmpeg (for bounded display images and thumbnails),
 Omarchy 4.0.4, systemd user session, timewall 2.1.0 and a working
 libheif decoder (timewall requires libheif >= 1.19.7). Current target: Arch Linux
 x86_64. Newer Omarchy/OWE releases have not been validated.
@@ -270,7 +271,7 @@ point. Install the shell plugin with:
 omarchy plugin add https://github.com/freedeaths/omarchy-heic.git --enable
 ```
 
-A compatible timewall 2.1.0, Python, GTK 3 and python-gobject are runtime
+A compatible timewall 2.1.0, Python, GTK 3, python-gobject and FFmpeg are runtime
 requirements. Omarchy's current plugin installer
 clones/validates/enables plugins; it does not run service installation hooks or
 install dependencies. Click **Set up service** in the panel once dependencies
@@ -321,6 +322,39 @@ French, German, Portuguese and Russian. Locale precedence remains LC_ALL,
 LC_MESSAGES, LANG, then Qt locale. Country variants select the base language
 (e.g. pt_BR and pt_PT both use Portuguese); unsupported languages fall back to
 English. Action buttons wrap within the panel for longer translated labels.
+
+## Very large wallpapers: Fuji.heic (0.3.1)
+
+A real Fuji.heic download contains eight 9600×7168 images. Importing and decoding
+the HEIC succeeds, but passing its full-size PNGs to Omarchy's Qt renderer fails:
+Qt budgets at least four bytes per pixel, so each frame requires 262.5 MiB,
+exceeding this system's 256 MiB image allocation limit. This is a decoded-image
+limit, not the compressed file size, and does not mean the HEIC is corrupt.
+
+The plugin now keeps the original HEIC and decoded frames, and generates separate
+display images and thumbnails. Display images preserve aspect ratio, never
+upscale, and retain enough pixels for crop-to-fill on the connected monitors'
+physical output sizes (including rotation). They are capped at 32 million pixels
+and an 8192-pixel longest edge. Without monitor information the target defaults
+to 3840×2160. On a 4K landscape display, Fuji becomes 3840×2867 for desktop use;
+its panel thumbnail is 1024×764. Resizing changes the derived image's spatial
+resolution; PNG encoding introduces no additional lossy compression. The HEIC's
+dynamic metadata and original image files are unchanged.
+
+Derivatives live inside each private library entry under `display/` and
+`thumbnails/`. FFmpeg prepares one image at a time and publishes files atomically.
+Cached images are reused, and damaged derivatives are rebuilt. Existing imports
+are prepared in the background when selected, or on service startup if already
+selected; importing the same HEIC also repairs missing derivatives without
+decoding it again. Monitor changes are observed at most every 30 seconds, with
+the next scheduled update/preview preparing any newly needed display size.
+Failed preparation leaves the last working desktop image in place and reports
+the error. Deleting an entry also removes its derivatives.
+
+File-manager thumbnails are independent: this Fuji file is about 54.9 MiB and
+Nautilus on the tested machine skips thumbnails above its 50 MB setting. Direct
+system thumbnail decoding succeeds. The plugin does not change Nautilus's
+preferences or Qt's global allocation limit.
 
 ## License, third-party dependencies and wallpaper rights
 
