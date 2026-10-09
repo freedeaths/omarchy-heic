@@ -1,0 +1,18 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const context = {};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync(path.join(__dirname, '../plugin/FrameInfo.js'), 'utf8').replace(/^\.pragma library\s*/, ''), context);
+const translate = (key, args) => key === 'solar_frame' ? `Sun alt ${args.altitude}° · az ${args.azimuth}°` : key;
+const time = {kind: 'time', properties: {ti: [{i: 0, t: 0.2916666567}, {i: 0, t: 0}, {i: 1, t: 0.75}]}};
+assert.equal(context.detail(time, 0, translate), '07:00');
+assert.equal(context.detail(time, 1, translate), '00:00');
+assert.equal(context.detail(time, 2, translate), '18:00');
+assert.equal(context.detail(time, 3, translate), '');
+assert.equal(context.detail({kind:'solar',properties:{si:[{i:0,a:-12.3,z:180}]}}, 0, translate), 'Sun alt -12.3° · az 180.0°');
+assert.equal(context.detail({kind:'appearance'}, 0, translate), 'light');
+assert.equal(context.detail({kind:'appearance'}, 1, translate), 'dark');
+assert.equal(context.detail(null, 0, translate), '');
+console.log('Frame times, repeated indices, solar positions and appearances passed');

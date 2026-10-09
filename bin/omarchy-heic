@@ -1,0 +1,714 @@
+#!/usr/bin/env python3
+"""HEIC dynamic desktop controller. Python standard library only."""
+import argparse
+import concurrent.futures
+import contextlib
+import datetime
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import plistlib
+import select
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import threading
+
+VERSION = '0.3.0'
+PLUGIN_ID = 'org.omarchy.heic'
+
+
+def atomic_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, tmp = tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f, ensure_ascii=False, allow_nan=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def read_json(path, default):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return default
+
+
+class Paths:
+    def __init__(self):
+        home = Path.home()
+        self.config = Path(os.environ.get('XDG_CONFIG_HOME', home / '.config')) / 'omarchy-heic'
+        self.data = Path(os.environ.get('XDG_DATA_HOME', home / '.local/share')) / 'omarchy-heic'
+        self.state = Path(os.environ.get('XDG_STATE_HOME', home / '.local/state')) / 'omarchy-heic'
+        self.cache = Path(os.environ.get('XDG_CACHE_HOME', home / '.cache')) / 'omarchy-heic'
+        self.runtime = Path(os.environ.get('XDG_RUNTIME_DIR', f'/tmp/omarchy-heic-{os.getuid()}')) / 'omarchy-heic'
+        self.background = Path(os.environ.get('XDG_STATE_HOME', home / '.local/state')) / 'omarchy/current/background'
+        self.theme = self.background.parent / 'theme.name'
+        self.theme_dir = self.background.parent / 'theme'
+        self.theme_lock = Path(os.environ.get('XDG_RUNTIME_DIR', '/tmp')) / 'omarchy-theme-set.lock'
+        self.socket = self.runtime / 'control.sock'
+        self.config_file = self.config / 'config.json'
+        self.state_file = self.state / 'state.json'
+
+    def prepare(self):
+        for p in (self.config, self.data, self.state, self.cache, self.runtime):
+            p.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.runtime, 0o700)
+
+
+def backend_run(args, env, timeout=300, confirmation=None):
+    """Kill the whole private process group, including timewall's unwaited setter."""
+    child = subprocess.Popen(args, env=env, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, start_new_session=True)
+    deadline = time.monotonic() + timeout
+    try:
+        out, err = child.communicate(timeout=timeout)
+        if child.returncode:
+            raise RuntimeError((err or out or f'backend exited {child.returncode}')[-3000:].strip())
+        if confirmation:
+            while not confirmation.exists():
+                if time.monotonic() > deadline:
+                    raise RuntimeError('timewall setter did not acknowledge the selected image')
+                time.sleep(0.02)
+        return out
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError('timewall timed out; previous wallpaper retained') from exc
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(child.pid, signal.SIGKILL)
+        child.wait()
+        child.stdout.close()
+        child.stderr.close()
+
+
+class Backend:
+    def __init__(self, paths):
+        self.paths = paths
+        self.binary = os.environ.get('OMARCHY_HEIC_TIMEWALL', 'timewall')
+        self.helper = Path(__file__).resolve().parent / 'omarchy-heic-capture'
+
+    def run(self, args, location=None, capture=False, simulated=None, dry=False):
+        self.paths.prepare()
+        # No prior setter PID can survive into another invocation.
+        with tempfile.TemporaryDirectory(prefix='call-', dir=self.paths.runtime) as tmp:
+            run_dir = Path(tmp)
+            result = run_dir / 'selected.json'
+            command = ['%f'] if dry else [str(self.helper), str(result), '%f']
+            text = '[geoclue]\nenable = false\n'
+            if location is not None:
+                text += f'\n[location]\nlat = {location["lat"]}\nlon = {location["lon"]}\n'
+            text += '\n[setter]\ncommand = ' + json.dumps(command) + '\nquiet = false\noverlap = 0\n'
+            (run_dir / 'config.toml').write_text(text)
+            env = os.environ.copy()
+            env.pop('TIMEWALL_DRY_RUN', None)
+            if simulated is not None:
+                env['TIMEWALL_OVERRIDE_TIME'] = simulated
+            if dry:
+                env['TIMEWALL_DRY_RUN'] = '1'
+            env.update(TIMEWALL_CONFIG_DIR=str(run_dir), TIMEWALL_RUNTIME_DIR=str(run_dir),
+                       TIMEWALL_CACHE_DIR=str(self.paths.cache / 'timewall'))
+            out = backend_run([self.binary, *args], env, confirmation=result if capture else None)
+            if dry:
+                if not out.startswith('Run: '):
+                    raise RuntimeError('Unexpected timewall preview response')
+                image = Path(out[5:].strip()).resolve(strict=True)
+                if not image.is_relative_to((self.paths.cache / 'timewall').resolve()):
+                    raise RuntimeError('timewall returned an image outside the private cache')
+                return str(image)
+            if capture:
+                image = Path(read_json(result, {})['image']).resolve(strict=True)
+                if not image.is_relative_to((self.paths.cache / 'timewall').resolve()):
+                    raise RuntimeError('timewall returned an image outside the private cache')
+                return str(image)
+            return out
+
+    def inspect(self, source):
+        with source.open('rb') as f:
+            digest = hashlib.file_digest(f, 'sha256').hexdigest()
+        target = self.paths.data / 'library' / digest
+        if not (target / 'metadata.json').exists():
+            self.run(['info', str(source)])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix='.import-', dir=target.parent) as tmp:
+                staged = Path(tmp)
+                owned = staged / 'wallpaper.heic'
+                shutil.copyfile(source, owned)
+                self.run(['unpack', str(owned), str(staged)])
+                with (staged / 'properties.xml').open('rb') as f:
+                    props = plistlib.load(f)
+                kind = 'time' if 'ti' in props else 'solar' if 'si' in props else 'appearance'
+                indices = [int(i['i']) for i in props.get('ti', props.get('si', []))]
+                if kind == 'appearance':
+                    indices = [int(props['l']), int(props['d'])]
+                if not indices or any(i < 0 or not (staged / f'{i}.png').is_file() for i in indices):
+                    raise RuntimeError('dynamic metadata refers to missing images')
+                meta = dict(id=digest, name=source.name, kind=kind, properties=props,
+                            frames=[dict(index=i, path=str(target / f'{i}.png')) for i in indices])
+                atomic_json(staged / 'metadata.json', meta)
+                if target.exists():
+                    shutil.rmtree(target)  # Only an incomplete plugin-owned import.
+                os.replace(staged, target)
+                # TemporaryDirectory cleanup sees the now absent staging directory.
+        return read_json(target / 'metadata.json', {})
+
+    def select(self, entry, location, appearance, simulated=None, dry=False):
+        # Time/appearance selection is cheap metadata arithmetic. Reuse decoded
+        # library images instead of hashing and unpacking the HEIC a second time.
+        properties = entry.get('properties', {})
+        index = None
+        if entry['kind'] == 'time':
+            override = simulated or os.environ.get('TIMEWALL_OVERRIDE_TIME')
+            instant = datetime.datetime.fromisoformat(override).astimezone() if override else datetime.datetime.now()
+            fraction = (instant.hour * 3600 + instant.minute * 60 + instant.second + instant.microsecond / 1e6) / 86400
+            marker = min(properties['ti'], key=lambda item: min(abs(float(item['t']) - fraction), 1 - abs(float(item['t']) - fraction)))
+            index = int(marker['i'])
+        elif entry['kind'] == 'appearance':
+            index = int(properties['l' if appearance == 'light' else 'd'])
+        if index is not None:
+            library = (self.paths.data / 'library' / entry['id']).resolve()
+            image = (library / f'{index}.png').resolve(strict=True)
+            if image.parent != library or not image.is_file():
+                raise RuntimeError('Invalid library image')
+            return str(image)
+        args = ['set', str(self.paths.data / 'library' / entry['id'] / 'wallpaper.heic')]
+        if entry['kind'] == 'appearance':
+            args += ['--appearance', appearance]
+        if entry['kind'] == 'solar' and location is None:
+            raise RuntimeError('Solar wallpaper needs a location; set latitude and longitude first')
+        return self.run(args, location, capture=not dry, simulated=simulated, dry=dry)
+
+
+    def day_plan(self, entry, location, day, cancelled, progress):
+        start = datetime.datetime.combine(day, datetime.time()).astimezone()
+        end = datetime.datetime.combine(day + datetime.timedelta(days=1), datetime.time()).astimezone()
+        total = int(end.timestamp() - start.timestamp())
+        frames = []
+        if entry['kind'] == 'appearance':
+            samples = [(0, 'light'), (total // 2, 'dark')]
+        elif entry['kind'] == 'time':
+            # timewall chooses the nearest time marker, including midnight wrap.
+            # Sample each marker and each circular midpoint to cover short phases.
+            markers = sorted({float(item['t']) % 1 for item in entry['properties']['ti']})
+            points = {0.0}
+            for i, marker in enumerate(markers):
+                following = markers[(i + 1) % len(markers)]
+                distance = (following - marker) % 1
+                points.add(marker * 86400)
+                points.add(math.floor(((marker + distance / 2) % 1) * 86400) + 1)
+            samples = [(min(86399, second), 'dark') for second in sorted(points)]
+        else:
+            # Ask upstream at each local minute: no duplicate solar algorithm.
+            samples = [(second, 'dark') for second in range(0, total, 60)]
+        for count, (second, appearance) in enumerate(samples):
+            if cancelled.is_set():
+                return None
+            instant = ((datetime.datetime.combine(day, datetime.time()) + datetime.timedelta(seconds=second)).astimezone()
+                       if entry['kind'] == 'time' else
+                       datetime.datetime.fromtimestamp(start.timestamp() + second).astimezone())
+            image = self.select(entry, location, appearance, instant.isoformat(), dry=True)
+            if not frames or frames[-1]['image'] != image:
+                frames.append(dict(image=image, time=instant.strftime('%H:%M'),
+                                   appearance=appearance if entry['kind'] == 'appearance' else None))
+            progress((count + 1) / len(samples))
+        return frames
+
+
+class Controller:
+    def __init__(self, paths, backend=None):
+        self.p = paths
+        self.p.prepare()
+        self.backend = backend or Backend(paths)
+        self.cfg = read_json(paths.config_file, dict(version=1, selected=None, location=None))
+        self.state = read_json(paths.state_file, dict(version=1, mode='disabled', image=None,
+                               previous=None, error=None, reason=None))
+        self.last_theme = self.theme_name()
+        self.theme_settling = 0.0
+        self.theme_pending = False
+        self.mismatch_since = None
+        self.next_compute = 0.0
+        self.force = self.state['mode'] == 'active' and self.background() == self.state.get('image')
+        self.last_clock = (time.time(), time.monotonic())
+        self.last_import = None
+        self.importing = None
+        self.import_job = None
+        self.import_cancel = threading.Event()
+        self.import_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.preview = None
+        self.preview_job = None
+        self.preview_cancel = threading.Event()
+        self.preview_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        # A persisted snapshot restores a preview interrupted by a crash/restart.
+        snapshot = self.state.pop('preview_restore', None)
+        if snapshot:
+            if self.background() in (snapshot.get('image'), snapshot.get('prior_image')) and snapshot.get('background'):
+                self.apply(snapshot['background'])
+            elif self.state['mode'] == 'active' and self.background() != snapshot.get('background'):
+                self.state.update(mode='paused', reason='External wallpaper selected')
+            self.save()
+
+
+    def save(self):
+        atomic_json(self.p.config_file, self.cfg)
+        atomic_json(self.p.state_file, self.state)
+
+    def entries(self):
+        return [read_json(p, {}) for p in sorted((self.p.data / 'library').glob('*/metadata.json'))]
+
+    def entry(self):
+        entry = next((e for e in self.entries() if e['id'] == self.cfg['selected']), None)
+        if not entry:
+            raise RuntimeError('Import and select a dynamic HEIC wallpaper first')
+        return entry
+
+    def theme_name(self):
+        try:
+            return self.p.theme.read_text().strip()
+        except FileNotFoundError:
+            return ''
+
+    def appearance(self):
+        colors = self.p.theme_dir / 'colors.toml'
+        if colors.exists():
+            value = subprocess.run(['omarchy-theme-color', '--file', str(colors), 'mode'],
+                                   capture_output=True, text=True, timeout=10)
+            if value.returncode == 0 and value.stdout.strip() in ('light', 'dark'):
+                return value.stdout.strip()
+        return 'light' if (self.p.theme_dir / 'light.mode').exists() else 'dark'
+
+    def background(self):
+        try:
+            return str(self.p.background.resolve(strict=True))
+        except (FileNotFoundError, OSError):
+            return None
+
+    def apply(self, image):
+        subprocess.run(['omarchy', 'theme', 'bg', 'set', image], check=True,
+                       capture_output=True, text=True, timeout=20)
+
+    def compute(self, force=False):
+        if self.state['mode'] != 'active':
+            return
+        before = self.background()
+        theme_before = self.theme_name()
+        image = self.backend.select(self.entry(), self.cfg.get('location'), self.appearance())
+        # A slow first decode must not overwrite a wallpaper chosen in the meantime.
+        if self.theme_busy() or self.theme_name() != theme_before:
+            self.theme_pending = True
+            return
+        if self.background() != before:
+            self.state.update(mode='paused', reason='Wallpaper changed while decoding')
+            self.save()
+            return
+        if force or image != self.state.get('image') or self.background() != image:
+            self.apply(image)
+        self.state.update(image=image, error=None, reason=None, updated_at=time.time())
+        self.next_compute = time.monotonic() + 60
+        self.force = False
+        self.save()
+
+    def theme_busy(self):
+        try:
+            with self.p.theme_lock.open('r') as f:
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return True
+        except FileNotFoundError:
+            pass
+        return False
+
+    def start_preview(self, seconds, date):
+        if self.preview:
+            raise ValueError('A desktop preview is already running')
+        seconds = float(seconds)
+        if not math.isfinite(seconds) or not 0.5 <= seconds <= 10:
+            raise ValueError('Seconds per frame must be between 0.5 and 10')
+        try:
+            day = datetime.date.fromisoformat(date) if date else datetime.date.today()
+        except ValueError as exc:
+            raise ValueError('Use a date in YYYY-MM-DD format') from exc
+        entry = self.entry()
+        location = self.cfg.get('location')
+        if entry['kind'] == 'solar' and location is None:
+            raise ValueError('Set a location before enabling this solar wallpaper')
+        self.preview_cancel = threading.Event()
+        self.preview = dict(phase='preparing', progress=0, seconds=seconds,
+                            date=day.isoformat(), index=0, count=0, total_seconds=None)
+        session = self.preview
+        def progress(value):
+            # Worker only updates this independent dict; all desktop writes stay serialized.
+            session['progress'] = value
+        self.preview_job = self.preview_pool.submit(self.backend.day_plan, entry, location,
+                                                    day, self.preview_cancel, progress)
+
+    def stop_preview(self, restore=True, external=True):
+        if not self.preview:
+            return
+        self.preview_cancel.set()
+        snapshot = self.state.pop('preview_restore', None)
+        if snapshot:
+            if restore and self.background() in (snapshot.get('image'), snapshot.get('prior_image')):
+                background = snapshot.get('background')
+                if background and Path(background).is_file():
+                    self.apply(background)
+            elif external and self.state['mode'] == 'active' and self.background() != snapshot.get('background'):
+                self.state.update(mode='paused', reason='External wallpaper selected')
+        self.preview = None
+        self.preview_job = None
+        self.force = False
+        self.next_compute = 0
+        self.mismatch_since = None
+        self.save()
+
+    def preview_tick(self, now):
+        if not self.preview:
+            return False
+        try:
+            if self.preview['phase'] == 'preparing':
+                if not self.preview_job.done():
+                    return False  # Normal scheduling continues during preparation.
+                frames = self.preview_job.result()
+                if not frames:
+                    self.stop_preview()
+                    return False
+                self.preview.update(phase='playing', frames=frames, count=len(frames),
+                                    total_seconds=len(frames) * self.preview['seconds'], deadline=now)
+                if not self.background():
+                    raise RuntimeError('Current wallpaper is unavailable')
+                self.state['preview_restore'] = dict(background=self.background(), image=None,
+                                                     theme=self.theme_name())
+                self.save()
+            snapshot = self.state['preview_restore']
+            if snapshot['image'] and (self.background() != snapshot['image'] or
+                    self.theme_busy() or self.theme_name() != snapshot['theme']):
+                # Any external wallpaper/theme action wins over the trial.
+                self.stop_preview(restore=False, external=not (self.theme_busy() or self.theme_name() != snapshot['theme']))
+                return False
+            if now >= self.preview['deadline']:
+                index = self.preview['index']
+                if index >= self.preview['count']:
+                    self.stop_preview()
+                    return False
+                frame = self.preview['frames'][index]
+                # Persist ownership before applying, so crash recovery is possible.
+                snapshot['prior_image'] = snapshot['image']
+                snapshot['image'] = frame['image']
+                self.save()
+                self.apply(frame['image'])
+                self.preview.update(index=index + 1, time=frame['time'], appearance=frame['appearance'],
+                                    deadline=time.monotonic() + self.preview['seconds'])
+            return True
+        except Exception as exc:
+            self.stop_preview()
+            self.state['error'] = str(exc)
+            self.save()
+            return False
+
+    def shutdown(self):
+        self.import_cancel.set()
+        self.stop_preview()
+        self.preview_pool.shutdown(wait=True, cancel_futures=True)
+        self.import_pool.shutdown(wait=True, cancel_futures=True)
+
+    def tick(self):
+        self.import_tick()
+        now = time.monotonic()
+        if self.preview_tick(now):
+            return
+        wall = time.time()
+        if wall - self.last_clock[0] - (now - self.last_clock[1]) > 3:
+            self.next_compute = 0  # Suspend/time change: recompute after ownership check.
+        self.last_clock = (wall, now)
+        theme = self.theme_name()
+        if self.theme_busy():
+            self.theme_pending = True
+            self.mismatch_since = None
+            return
+        if self.theme_pending or theme != self.last_theme:
+            self.last_theme = theme
+            self.theme_pending = False
+            self.theme_settling = now + 2
+            self.force = True
+        if now < self.theme_settling:
+            return
+        if self.state['mode'] != 'active':
+            return
+        current = self.background()
+        if not self.force and self.state.get('image') and current != self.state['image']:
+            if self.mismatch_since is None:
+                self.mismatch_since = now
+            if now - self.mismatch_since >= 2:
+                self.state.update(mode='paused', reason='External wallpaper selected', error=None)
+                self.save()
+            return
+        self.mismatch_since = None
+        if self.force or now >= self.next_compute:
+            try:
+                self.compute(self.force)
+            except Exception as exc:
+                self.state['error'] = str(exc)
+                self.next_compute = now + 60
+                self.force = False
+                self.save()
+                print(f'Wallpaper update failed: {exc}', file=sys.stderr, flush=True)
+
+    def status(self):
+        return dict(**self.state, plugin_version=VERSION, selected=self.cfg.get('selected'),
+                    location=self.cfg.get('location'), library=self.entries(), import_result=self.last_import,
+                    importing=self.importing,
+                    preview={k: v for k, v in self.preview.items() if k not in ('frames', 'deadline')} if self.preview else None,
+                    theme=self.theme_name(), backend=shutil.which(self.backend.binary) is not None)
+
+    def import_files(self, files, progress=None):
+        result = dict(imported=[], errors=[])
+        for index, name in enumerate(files):
+            if progress is not None and self.import_cancel.is_set():
+                break
+            try:
+                source = Path(name).expanduser().resolve(strict=True)
+                if source.suffix.lower() not in ('.heic', '.heif') or not source.is_file():
+                    raise ValueError('Choose a HEIC or HEIF file')
+                entry = self.backend.inspect(source)
+                result['imported'].append(entry['id'])
+            except Exception as exc:
+                result['errors'].append(dict(file=str(name), error=str(exc)))
+                print(f'HEIC import failed: {name}: {exc}', file=sys.stderr, flush=True)
+            if progress is not None:
+                progress['completed'] = index + 1
+        result['finished_at'] = time.time_ns()
+        return result
+
+    def finish_import(self, result):
+        self.last_import = result
+        if result['imported']:
+            self.cfg['selected'] = result['imported'][-1]
+            self.force = True
+
+    def import_tick(self):
+        if self.import_job is None or not self.import_job.done():
+            return
+        try:
+            self.finish_import(self.import_job.result())
+        except Exception as exc:
+            self.state['error'] = str(exc)
+        self.import_job = None
+        self.importing = None
+        self.save()
+
+    def dispatch(self, request):
+        cmd = request.get('command')
+        if cmd == 'status':
+            return self.status()
+        if cmd == 'preview':
+            if self.importing:
+                raise ValueError('An import is already running')
+            self.start_preview(request.get('seconds', 2), request.get('date'))
+            return self.status()
+        if cmd == 'preview-stop':
+            self.stop_preview()
+            return self.status()
+        if self.importing and cmd not in ('pause', 'disable', 'theme-changed'):
+            raise ValueError('An import is already running')
+        if self.preview and cmd != 'theme-changed':
+            self.stop_preview()
+        if cmd == 'import':
+            files = request.get('files') or [request['file']]
+            if request.get('background'):
+                self.import_cancel.clear()
+                self.last_import = None
+                self.importing = dict(completed=0, total=len(files))
+                self.import_job = self.import_pool.submit(self.import_files, files, self.importing)
+            else:
+                self.finish_import(self.import_files(files))
+        elif cmd == 'select':
+            if request['id'] not in [e['id'] for e in self.entries()]:
+                raise ValueError('Unknown wallpaper')
+            self.cfg['selected'] = request['id']
+            self.force = True
+        elif cmd == 'remove':
+            identity = request['id']
+            if identity not in [e['id'] for e in self.entries()]:
+                raise ValueError('Unknown wallpaper')
+            library = self.p.data / 'library'
+            target = library / identity
+            if identity in ('.', '..') or Path(identity).name != identity or target.is_symlink() or target.resolve().parent != library.resolve():
+                raise ValueError('Invalid library path')
+            selected = identity == self.cfg.get('selected')
+            if selected and self.background() == self.state.get('image'):
+                previous = self.state.get('previous')
+                if previous and Path(previous).is_file():
+                    self.apply(previous)
+            # Scheduling now renders library PNGs directly. If the old wallpaper
+            # is unavailable (or a library frame was manually chosen), retain the
+            # visible pixels before deleting their library directory.
+            visible = self.background()
+            if visible and Path(visible).is_relative_to(target.resolve()):
+                retained = self.p.cache / 'retained' / (identity + '-' + Path(visible).name)
+                retained.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                shutil.copyfile(visible, retained)
+                self.apply(str(retained))
+            shutil.rmtree(target)
+            if selected:
+                self.cfg['selected'] = None
+                self.state.update(mode='disabled', image=None, error=None, reason=None)
+                self.force = False
+            self.last_import = None
+        elif cmd == 'location':
+            lat, lon = float(request['lat']), float(request['lon'])
+            if not math.isfinite(lat) or not math.isfinite(lon) or not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                raise ValueError('Latitude must be -90…90, longitude -180…180')
+            self.cfg['location'] = dict(lat=lat, lon=lon)
+            self.force = True
+        elif cmd == 'import-location':
+            config = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'darkman/config.yaml'
+            values = {}
+            for line in config.read_text().splitlines():
+                key, sep, val = line.partition(':')
+                if sep and key.strip() in ('lat', 'lng'):
+                    values[key.strip()] = float(val.split('#')[0].strip())
+            return self.dispatch(dict(command='location', lat=values['lat'], lon=values['lng']))
+        elif cmd in ('enable', 'resume'):
+            entry = self.entry()
+            if entry['kind'] == 'solar' and self.cfg.get('location') is None:
+                raise ValueError('Set a location before enabling this solar wallpaper')
+            if self.state['mode'] == 'disabled':
+                self.state['previous'] = self.background()
+            self.state.update(mode='active', error=None, reason=None)
+            self.force = True
+        elif cmd == 'pause':
+            self.state.update(mode='paused', reason='Paused by user')
+        elif cmd == 'disable':
+            if self.background() == self.state.get('image'):
+                previous = self.state.get('previous')
+                if previous and Path(previous).is_file():
+                    self.apply(previous)
+            self.state.update(mode='disabled', error=None, reason=None)
+        elif cmd in ('refresh', 'theme-changed'):
+            self.force = True
+            self.theme_pending = True
+        else:
+            raise ValueError('Unknown command')
+        self.save()
+        return self.status()
+
+
+def read_request(conn):
+    buf = bytearray()
+    while b'\n' not in buf:
+        part = conn.recv(65536)
+        if not part:
+            raise ValueError('Incomplete request')
+        buf.extend(part)
+        if len(buf) > 1048576:
+            raise ValueError('Request too large')
+    return json.loads(buf.split(b'\n', 1)[0])
+
+
+def serve(paths):
+    paths.prepare()
+    with (paths.runtime / 'daemon.lock').open('w') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('Controller is already running')
+        paths.socket.unlink(missing_ok=True)
+        controller = Controller(paths)
+        running = True
+        def stop(*_):
+            nonlocal running
+            running = False
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+        with socket.socket(socket.AF_UNIX) as server:
+            server.bind(str(paths.socket))
+            os.chmod(paths.socket, 0o600)
+            server.listen(8)
+            try:
+                while running:
+                    ready, _, _ = select.select([server], [], [], 0.1 if controller.preview or controller.importing else 1)
+                    if ready:
+                        conn, _ = server.accept()
+                        with conn:
+                            conn.settimeout(10)
+                            try:
+                                result = dict(ok=True, data=controller.dispatch(read_request(conn)))
+                            except Exception as exc:
+                                result = dict(ok=False, error=str(exc))
+                            with contextlib.suppress(BrokenPipeError, socket.timeout):
+                                conn.sendall((json.dumps(result, ensure_ascii=False) + '\n').encode())
+                    if running:
+                        controller.tick()
+            finally:
+                controller.shutdown()
+                paths.socket.unlink(missing_ok=True)
+
+
+def client(paths, request):
+    with socket.socket(socket.AF_UNIX) as conn:
+        conn.settimeout(330)
+        try:
+            conn.connect(str(paths.socket))
+        except (FileNotFoundError, ConnectionRefusedError) as exc:
+            if request['command'] == 'status':
+                state = read_json(paths.state_file, dict(mode='disabled', error=None))
+                cfg = read_json(paths.config_file, {})
+                return dict(**state, selected=cfg.get('selected'), location=cfg.get('location'),
+                            library=[read_json(p, {}) for p in sorted((paths.data / 'library').glob('*/metadata.json'))],
+                            service=False, backend=shutil.which(os.environ.get('OMARCHY_HEIC_TIMEWALL', 'timewall')) is not None)
+            raise RuntimeError('Start the controller: systemctl --user start omarchy-heic.service') from exc
+        conn.sendall((json.dumps(request) + '\n').encode())
+        result = read_request(conn)
+        if not result['ok']:
+            raise RuntimeError(result['error'])
+        return dict(**result['data'], service=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--version', action='version', version=VERSION)
+    sub = parser.add_subparsers(dest='command', required=True)
+    sub.add_parser('daemon')
+    status = sub.add_parser('status')
+    status.add_argument('--json', action='store_true')
+    imp = sub.add_parser('import')
+    imp.add_argument('files', nargs='+')
+    imp.add_argument('--background', action='store_true', help='Return immediately and expose progress in status')
+    sel = sub.add_parser('select')
+    sel.add_argument('id')
+    rem = sub.add_parser('remove', help='Remove an imported library copy, preserving the source file')
+    rem.add_argument('id')
+    loc = sub.add_parser('location')
+    loc.add_argument('lat', type=float)
+    loc.add_argument('lon', type=float)
+    preview = sub.add_parser('preview')
+    preview.add_argument('--seconds', type=float, default=2)
+    preview.add_argument('--date', help='Local calendar date, YYYY-MM-DD; default today')
+    sub.add_parser('preview-stop')
+    for name in ('import-location', 'enable', 'pause', 'resume', 'disable', 'refresh', 'theme-changed'):
+        sub.add_parser(name)
+    args = vars(parser.parse_args())
+    args.pop('json', None)
+    try:
+        if args['command'] == 'daemon':
+            serve(Paths())
+        else:
+            print(json.dumps(client(Paths(), args), ensure_ascii=False))
+    except Exception as exc:
+        print(json.dumps(dict(ok=False, error=str(exc)), ensure_ascii=False), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

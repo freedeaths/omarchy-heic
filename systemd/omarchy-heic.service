@@ -1,0 +1,17 @@
+[Unit]
+Description=HEIC dynamic desktop for Omarchy
+After=graphical-session.target
+PartOf=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/omarchy-heic daemon
+Environment=PATH=%h/.local/bin:/usr/share/omarchy/bin:/usr/local/bin:/usr/bin
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+KillMode=control-group
+
+[Install]
+WantedBy=graphical-session.target

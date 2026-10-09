@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "org.omarchy.heic",
+  "name": "HEIC Dynamic Desktop",
+  "version": "0.3.0",
+  "author": "Omarchy HEIC contributors",
+  "license": "MIT",
+  "description": "Apple HEIC dynamic wallpapers powered by timewall",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "plugin/Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Dynamic Desktop",
+    "description": "Import, preview and schedule HEIC wallpapers",
+    "category": "Style",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {},
+    "schema": []
+  }
+}
