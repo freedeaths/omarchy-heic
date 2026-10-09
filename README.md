@@ -42,8 +42,8 @@ to step 3. Otherwise, the tested source-build path is:
 omarchy pkg add python python-gobject gtk3 libheif git pkgconf clang rustup
 rustup toolchain install stable
 mkdir -p ~/Repos
-git clone https://github.com/bcyran/timewall.git ~/Repos/timewall
-git -C ~/Repos/timewall checkout 19897aee9fee4f4ebd5cbd37b0fc4e3271cb6480
+git clone https://github.com/bcyran/timewall.git ~/Repos/timewall &&
+git -C ~/Repos/timewall checkout --detach 19897aee9fee4f4ebd5cbd37b0fc4e3271cb6480 &&
 python3 scripts/build-timewall.py --source ~/Repos/timewall --fast-png
 ```
 
@@ -111,8 +111,8 @@ encoding (requires Rust stable, pkg-config, clang and libheif headers):
 ```sh
 git clone https://github.com/freedeaths/omarchy-heic.git ~/Repos/omarchy-heic
 cd ~/Repos/omarchy-heic
-git clone https://github.com/bcyran/timewall.git ~/Repos/timewall
-git -C ~/Repos/timewall checkout 19897aee9fee4f4ebd5cbd37b0fc4e3271cb6480
+git clone https://github.com/bcyran/timewall.git ~/Repos/timewall &&
+git -C ~/Repos/timewall checkout --detach 19897aee9fee4f4ebd5cbd37b0fc4e3271cb6480 &&
 python3 scripts/build-timewall.py --source ~/Repos/timewall --fast-png
 OMARCHY_HEIC_TIMEWALL="$PWD/.test-output/timewall-target/release/timewall" python3 -m unittest discover -s tests -v
 python3 install.py --backend .test-output/timewall-target/release/timewall
