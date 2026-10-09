@@ -78,7 +78,12 @@ def install(backend, shell_managed=False):
     # Preflight all file conflicts before writing any of the installation.
     mappings = [(ROOT / 'bin' / name, BIN / name) for name in ('omarchy-heic', 'omarchy-heic-capture', 'omarchy-heic-picker')]
     if not shell_managed:
-        mappings += [(src, CONFIG / 'omarchy/plugins' / ID / src.name) for src in (ROOT / 'plugin').iterdir() if src.is_file()]
+        # Marketplace packages have one root manifest. The standalone installer
+        # flattens plugin/ and installs its compatibility manifest under the
+        # filename expected by Omarchy, preserving existing installations.
+        mappings += [(src, CONFIG / 'omarchy/plugins' / ID /
+                      ('manifest.json' if src.name == 'standalone-manifest.json' else src.name))
+                     for src in (ROOT / 'plugin').iterdir() if src.is_file()]
     mappings += [(ROOT / 'systemd/omarchy-heic.service', CONFIG / 'systemd/user/omarchy-heic.service'),
                  (ROOT / 'hooks/90-omarchy-heic', CONFIG / 'omarchy/hooks/theme-set.d/90-omarchy-heic')]
     if backend and Path(backend).resolve() != (BIN / 'timewall').resolve():

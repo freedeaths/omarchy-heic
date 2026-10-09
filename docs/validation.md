@@ -157,3 +157,11 @@ passed). Locale and frame-label Node checks and the real offscreen Quickshell
 library interaction check passed. The publication includes only source, docs,
 manifest and tests; built binaries, decoded artwork, screenshots and temporary
 XDG data are excluded.
+
+Marketplace submission requires exactly one `manifest.json` at the repository
+root. The standalone compatibility manifest is therefore named
+`plugin/standalone-manifest.json`; the Python installer still installs it as
+`manifest.json` with the flattened `Panel.qml` entry point. Repeat-install and
+uninstall regression checks cover this mapping. The submission preparation run
+passed 44 Python tests, skipping 11 backend/live-desktop tests, and the root
+package passed `omarchy-plugin-validate`.

@@ -38,6 +38,11 @@ class InstallerTests(unittest.TestCase):
     def test_repeat_install_and_uninstall_preserve_other_configuration(self):
         installer.install(self.backend)
         installer.install(self.backend)
+        plugin = installer.CONFIG / 'omarchy/plugins' / installer.ID
+        manifest = json.loads((plugin / 'manifest.json').read_text())
+        self.assertEqual(manifest['entryPoints']['barWidget'], 'Panel.qml')
+        self.assertTrue((plugin / manifest['entryPoints']['barWidget']).is_file())
+        self.assertFalse((plugin / 'standalone-manifest.json').exists())
         cfg = json.loads(self.shell.read_text())
         self.assertEqual(cfg['custom'], self.original['custom'])
         self.assertEqual(cfg['plugins'], self.original['plugins'])
