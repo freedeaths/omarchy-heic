@@ -5,7 +5,7 @@
   "version": "0.3.0",
   "author": "Omarchy HEIC contributors",
   "license": "MIT",
-  "description": "Apple HEIC dynamic wallpapers powered by timewall",
+  "description": "Import HEIC/HEIF dynamic wallpapers, inspect frames and preview a day on your desktop. Supports time, solar and light/dark schedules via timewall. Install the bar plugin, then prepare timewall and set up the user service; see the README's Install on Omarchy steps.",
   "kinds": [
     "bar-widget"
   ],

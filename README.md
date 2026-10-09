@@ -4,7 +4,98 @@ An Omarchy 4 bar plugin for original Apple HEIC/HEIF dynamic wallpapers. Uses
 [timewall](https://github.com/bcyran/timewall) 2.1.0 as an external backend and
 Omarchy's existing background renderer. No theme or compositor replacement.
 
-## Requirements and installation
+Import several dynamic wallpapers, inspect individual frames in the compact bar
+panel, or play a full-desktop day preview at two seconds per frame. Time-based,
+solar and light/dark schedules are supported. Imported originals are copied into
+a private library; the panel follows the system language with nine translations.
+
+![Dynamic Desktop panel, with third-party wallpaper artwork replaced for publication](preview.png)
+
+The screenshot is cropped from a real screen recording. The wallpaper image and
+library filename have been replaced for publication; the surrounding controls
+are the actual plugin UI. No third-party wallpaper artwork is distributed.
+
+## Install on Omarchy
+
+**One-time setup is required.** `omarchy plugin add` installs the bar panel;
+timewall and the user service must also be prepared. The marketplace's **Manual
+setup** label refers to this additional step. Tested on Omarchy 4.0.4 / Arch Linux
+x86_64; newer Omarchy/OWE releases have not been validated.
+
+### 1. Install the bar plugin
+
+```sh
+omarchy plugin add https://github.com/freedeaths/omarchy-heic.git --enable
+cd ~/.config/omarchy/plugins/org.omarchy.heic
+```
+
+Confirm the Omarchy prompts and choose a bar position. The wallpaper icon opens
+the panel. Installing the panel does not enable dynamic wallpaper playback.
+
+### 2. Prepare dependencies and timewall
+
+If you already have a compatible **timewall 2.1.0** on PATH, install the runtime
+packages with `omarchy pkg add python python-gobject gtk3 libheif`, then continue
+to step 3. Otherwise, the tested source-build path is:
+
+```sh
+omarchy pkg add python python-gobject gtk3 libheif git pkgconf clang rustup
+rustup toolchain install stable
+mkdir -p ~/Repos
+git clone https://github.com/bcyran/timewall.git ~/Repos/timewall
+git -C ~/Repos/timewall checkout 19897aee9fee4f4ebd5cbd37b0fc4e3271cb6480
+python3 scripts/build-timewall.py --source ~/Repos/timewall --fast-png
+```
+
+Package installation may request your administrator password. If Rust/rustup is
+already managed by another tool, use that existing stable rustup toolchain
+instead of installing a conflicting Rust package. If `~/Repos/timewall` already
+exists, use a separate clean checkout; the build helper requires the exact
+upstream commit and refuses local modifications. The first Rust build downloads
+dependencies and can take several minutes. See backend compatibility below for
+the libheif 1.23.4 build rationale.
+
+### 3. Set up the user service
+
+For the backend built in step 2, run from the plugin checkout:
+
+```sh
+python3 install.py --shell-managed --backend .test-output/timewall-target/release/timewall
+```
+
+This installs the backend into `~/.local/bin`, the controller and a systemd user
+service. It preserves the Omarchy-managed plugin/bar and needs no administrator
+privileges. If a compatible timewall is already on PATH, click **Set up service**
+in the panel instead, or run `python3 install.py --shell-managed`.
+
+### 4. Import and enable a wallpaper
+
+Open the wallpaper icon in the bar, click **Import HEIC**, and select one or more
+HEIC/HEIF files you have permission to use. Files must contain Apple dynamic
+wallpaper metadata; ordinary still HEIC images are rejected. After import:
+
+- Select a wallpaper in the library dropdown.
+- For a solar wallpaper, enter latitude/longitude; time wallpapers need no
+  location, and light/dark wallpapers follow the Omarchy theme.
+- Click **Enable** for automatic changes, or **Preview** to simulate a day on
+  the desktop. Preview restores the previous wallpaper when it finishes.
+
+Use the arrows for individual frame previews in the small image. Imported
+originals are retained in `~/.local/share/omarchy-heic/library/`, so their source
+files can be moved or deleted after a successful import.
+
+If setup fails, check the panel message and run:
+
+```sh
+omarchy-heic status --json
+journalctl --user -u omarchy-heic.service -n 50 --no-pager
+```
+
+The marketplace's verified snapshot covers the exact listed commit; the install
+command clones current upstream code. Consult the listing's snapshot link if you
+need to compare the installed commit with the reviewed version.
+
+## Backend compatibility and standalone installation
 
 Python 3.11+, GTK 3 and python-gobject (for the isolated multi-file chooser),
 Omarchy 4.0.4, systemd user session, timewall 2.1.0 and a working
@@ -251,6 +342,12 @@ dependencies.
   support does not grant rights to an image. Users must have the rights needed
   for their use of imported files; publishing or redistributing wallpapers or
   screenshots containing them may require separate permission.
+  Wallpapers downloaded from [Dynamic Wallpaper Club](https://dynamicwallpaper.club)
+  are subject to its [Terms of Service](https://dynamicwallpaper.club/tos):
+  personal non-commercial use is allowed, qualifying fair-use reviews/articles/
+  videos require attribution to the original author and DWC, and commercial use
+  is prohibited. A download is not a blanket license to redistribute or promote
+  a project using the artwork; the platform does not warrant non-infringement.
 - HEIC commonly uses HEVC, which can be subject to patent licensing. Open-source
   copyright licenses do not establish that all necessary patent rights are
   available. Requirements depend on jurisdiction and use/distribution model;
